@@ -163,6 +163,18 @@ class AirsimBridge:
         self.save_image(img, file_path)
         print("Image saved")
 
+
+def _resolve_unrealcv_port(ue_port) -> int:
+    """Порт UnrealCV: сначала OPENFLY_UNREALCV_PORT, иначе аргумент UEBridge(ue_port=…), иначе 9030."""
+    env_s = str(os.environ.get("OPENFLY_UNREALCV_PORT", "")).strip()
+    if env_s:
+        return int(env_s)
+    p = str(ue_port).strip() if ue_port is not None else ""
+    if p:
+        return int(p)
+    return 9030
+
+
 class UEBridge:
     def __init__(self, ue_ip, ue_port, env_name):
         self.env_name = env_name
@@ -177,9 +189,8 @@ class UEBridge:
                 "UEBridge: OPENFLY_UE_ATTACH_ONLY=1 — не kill и не Popen CitySample; только UnrealCV.",
                 flush=True,
             )
-            raw_port = (os.environ.get("OPENFLY_UNREALCV_PORT", "9030") or "9030").strip()
             self._ue_ip = ue_ip
-            self._ue_port = int(raw_port)
+            self._ue_port = _resolve_unrealcv_port(ue_port)
             # Как во встроенном старте: там перед connect ждут OPENFLY_UE_WARMUP_SEC (90 по умолчанию),
             # пока CitySample поднимает движок и UnrealCV. Раньше attach ждал только 4 с — из-за этого
             # казалось, что «TCP сломался», хотя просто рано дергали connect.
@@ -200,9 +211,9 @@ class UEBridge:
             # Как capture_openfly_ue_frames.py: короткая пауза после kill, затем сразу старт UE.
             time.sleep(float(os.environ.get("OPENFLY_UE_POST_KILL_SEC", "2")))
 
-            port = int((os.environ.get("OPENFLY_UNREALCV_PORT", "9030") or "9030").strip())
+            port = _resolve_unrealcv_port(ue_port)
             print(
-                f"UnrealCV Port={port} (OPENFLY_UNREALCV_PORT, default 9030 — written to unrealcv.ini before UE start)",
+                f"UnrealCV Port={port} (OPENFLY_UNREALCV_PORT или UEBridge(ue_port=…), default 9030 → unrealcv.ini)",
                 flush=True,
             )
             self.modify_port_in_ini(port, env_name)
@@ -930,7 +941,7 @@ def main():
             env_bridge = AirsimBridge(env_name)
             pos_ratio = 1.0
         elif "ue" in env_name:
-            env_bridge = UEBridge(ue_ip="127.0.0.1", ue_port="9000", env_name=env_name)
+            env_bridge = UEBridge(ue_ip="127.0.0.1", ue_port="9030", env_name=env_name)
             pos_ratio = 1.0
         elif "gs" in env_name:
             env_bridge = GSBridge(env_name)
