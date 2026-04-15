@@ -331,6 +331,16 @@ class UEBridge:
             command.extend(shlex.split(extra_args))
         print("CitySample cmd:", command, "cwd=", env_dir_abs, flush=True)
 
+        # Старый /tmp/unrealcv_<port>.socket от мёртвого процесса оставляет path существующим:
+        # _connection_check тогда шлёт Client(..., 'unix') и не попадает в живой TCP на том же порту.
+        stale_sock = f"/tmp/unrealcv_{int(self._ue_port)}.socket"
+        if os.path.exists(stale_sock):
+            try:
+                os.unlink(stale_sock)
+                print(f"UEBridge: удалён устаревший UnrealCV unix-сокет {stale_sock!r}", flush=True)
+            except OSError as e:
+                print(f"UEBridge: не удалось удалить {stale_sock!r}: {e}", flush=True)
+
         # Long-running UE: avoid PIPE (deadlock). Optional log: OPENFLY_UE_LOGFILE=/tmp/ue.log
         # Держим файловый объект на self — иначе после выхода из функции GC может закрыть FD родителя.
         log_path = os.environ.get("OPENFLY_UE_LOGFILE", "").strip()
