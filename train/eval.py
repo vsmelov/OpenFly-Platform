@@ -377,10 +377,42 @@ class UEBridge:
             proc = getattr(self, "process", None)
             if proc is not None and proc.poll() is not None:
                 rc = proc.returncode
+                log_path = os.environ.get("OPENFLY_UE_LOGFILE", "").strip()
+                gpu_hint = ""
+                if log_path and os.path.isfile(log_path):
+                    try:
+                        with open(log_path, "rb") as lf:
+                            tail = lf.read()[-12000:]
+                        if b"VK_ERROR_DEVICE_LOST" in tail or b"GPUCrash" in tail:
+                            gpu_hint = (
+                                " В хвосте лога есть VK_ERROR_DEVICE_LOST/GPUCrash (Vulkan): "
+                                "убейте CrashReportClient и CitySample, затем снова дашборд."
+                            )
+                    except OSError:
+                        pass
                 raise RuntimeError(
-                    f"CitySample завершился до готовности UnrealCV (exit code={rc}). "
-                    "См. OPENFLY_UE_LOGFILE, docker logs контейнера, на хосте dmesg при подозрении на OOM."
+                    f"CitySample завершился до готовности UnrealCV (exit code={rc}).{gpu_hint} "
+                    "См. OPENFLY_UE_LOGFILE и City_UE52/Saved/Crashes/, dmesg при подозрении на OOM."
                 )
+            if (
+                not self._attach_only
+                and attempt >= 6
+                and proc is not None
+                and proc.poll() is None
+            ):
+                chk = subprocess.run(
+                    ["pgrep", "-f", "City_UE52/Binaries/Linux/CitySample"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                )
+                if not chk.stdout.strip():
+                    raise RuntimeError(
+                        "CitySample уже не в процессах, а обёртка (bash) ещё жива — обычно UE упал "
+                        "(часто GPUCrash / VK_ERROR_DEVICE_LOST), остался CrashReportClient. "
+                        "pkill -f CrashReportClient; pkill -f CitySample; перезапуск дашборда. "
+                        "См. OPENFLY_UE_LOGFILE и City_UE52/Saved/Crashes/."
+                    )
             c_old = getattr(self, "_client", None)
             if c_old is not None:
                 try:
@@ -437,7 +469,10 @@ class UEBridge:
                 )
             time.sleep(5)
         print("UnrealCV is not connected (timeout)", flush=True)
-        raise SystemExit(1)
+        raise RuntimeError(
+            f"UnrealCV не подключился за {extra:.0f}s (OPENFLY_UNREALCV_WAIT_EXTRA_SEC). "
+            "Проверьте CitySample и порт в unrealcv.ini; при падении UE см. OPENFLY_UE_LOGFILE."
+        )
 
     def set_camera_pose(self, x, y, z, pitch, yaw, roll):
         '''Set camera position'''
