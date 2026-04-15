@@ -542,6 +542,11 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             input_ids = torch.cat(
                 (input_ids, torch.unsqueeze(torch.Tensor([29871]).long(), dim=0).to(input_ids.device)), dim=1
             )
+            # Иначе длина attention_mask не совпадает с input_ids → рассинхрон causal mask (напр. 263 vs 262).
+            am = kwargs.get("attention_mask")
+            if am is not None:
+                one = torch.ones((am.shape[0], 1), device=am.device, dtype=am.dtype)
+                kwargs["attention_mask"] = torch.cat((am, one), dim=1)
 
         # Run VLA inference
         generated_ids = self.generate(input_ids, max_new_tokens=self.get_action_dim(unnorm_key), **kwargs)

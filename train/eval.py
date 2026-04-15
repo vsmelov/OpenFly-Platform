@@ -5,17 +5,19 @@ import numpy as np
 import io
 import time
 import math
+import shlex
 import subprocess, threading
+import traceback
 import airsim
 from common import *
 import psutil
 import requests
-import random
 import numpy as np
 import torch
 from PIL import Image
 from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor
-import os, json
+import glob
+import os, json, sys
 from extern.hf.configuration_prismatic import OpenFlyConfig
 from extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
@@ -27,11 +29,33 @@ AutoProcessor.register(OpenFlyConfig, PrismaticProcessor)
 AutoModelForVision2Seq.register(OpenFlyConfig, OpenVLAForActionPrediction)
 
 
+def ue_camera_pose_from_env():
+    """Совпадает с scripts/capture_openfly_ue_frames.py — OPENFLY_UE_CAMERA_*."""
+
+    def _f(key, default):
+        v = os.environ.get(key, "").strip()
+        return float(v) if v else default
+
+    return (
+        _f("OPENFLY_UE_CAMERA_X", 150),
+        _f("OPENFLY_UE_CAMERA_Y", 400),
+        _f("OPENFLY_UE_CAMERA_Z", 15),
+        _f("OPENFLY_UE_CAMERA_PITCH", 0),
+        _f("OPENFLY_UE_CAMERA_YAW", 0),
+        _f("OPENFLY_UE_CAMERA_ROLL", 0),
+    )
+
+
 def kill_env_process(keyword):
     result = subprocess.run(['pgrep', '-n', keyword], stdout=subprocess.PIPE)
     cr_pid = result.stdout.decode().strip()
     if len(cr_pid) > 0:
         subprocess.run(['kill', '-9', cr_pid])
+
+
+def _openfly_ue_attach_only() -> bool:
+    """Подключиться к уже запущенному CitySample + UnrealCV (дашборд перезапускается без убийства UE)."""
+    return os.environ.get("OPENFLY_UE_ATTACH_ONLY", "").strip().lower() in ("1", "true", "yes", "on")
 
 class AirsimBridge:
     def __init__(self, env_name):
@@ -125,25 +149,92 @@ class AirsimBridge:
 
 class UEBridge:
     def __init__(self, ue_ip, ue_port, env_name):
-        self.kill_failed_process()
-        time.sleep(10)
-
-        # port = self.find_available_port()
-
-        port = random.randint(9000, 9100)
-        print(f"Available port: {port}")
-        self.modify_port_in_ini(port, env_name)
-        ue_port = port
-
         self.env_name = env_name
-        self._sim_thread = threading.Thread(target=self._init_ue_sim)
-        self._sim_thread.start()
-        time.sleep(15)
+        self._client = None
+        self.process = None
+        self._ue_log_fp = None
+        self._sim_init_error = None
+        self._attach_only = _openfly_ue_attach_only()
 
-        self._client = Client((ue_ip, ue_port))
+        if self._attach_only:
+            print(
+                "UEBridge: OPENFLY_UE_ATTACH_ONLY=1 — не kill и не Popen CitySample; только UnrealCV.",
+                flush=True,
+            )
+            raw_port = (os.environ.get("OPENFLY_UNREALCV_PORT", "9030") or "9030").strip()
+            self._ue_ip = ue_ip
+            self._ue_port = int(raw_port)
+            # Как во встроенном старте: там перед connect ждут OPENFLY_UE_WARMUP_SEC (90 по умолчанию),
+            # пока CitySample поднимает движок и UnrealCV. Раньше attach ждал только 4 с — из-за этого
+            # казалось, что «TCP сломался», хотя просто рано дергали connect.
+            raw_w = os.environ.get("OPENFLY_UE_ATTACH_WARMUP_SEC", "").strip()
+            if raw_w:
+                warmup = float(raw_w)
+            else:
+                warmup = float(os.environ.get("OPENFLY_UE_WARMUP_SEC", "90"))
+            print(
+                f"Attach: пауза {warmup}s (как OPENFLY_UE_WARMUP_SEC во встроенном режиме), "
+                f"затем UnrealCV к {self._ue_ip}:{self._ue_port} "
+                f"(дальше OPENFLY_UNREALCV_WAIT_EXTRA_SEC в _connection_check)…",
+                flush=True,
+            )
+            time.sleep(warmup)
+        else:
+            self.kill_failed_process()
+            # Как capture_openfly_ue_frames.py: короткая пауза после kill, затем сразу старт UE.
+            time.sleep(float(os.environ.get("OPENFLY_UE_POST_KILL_SEC", "2")))
+
+            port = int((os.environ.get("OPENFLY_UNREALCV_PORT", "9030") or "9030").strip())
+            print(
+                f"UnrealCV Port={port} (OPENFLY_UNREALCV_PORT, default 9030 — written to unrealcv.ini before UE start)",
+                flush=True,
+            )
+            self.modify_port_in_ini(port, env_name)
+
+            self._ue_ip = ue_ip
+            self._ue_port = int(port)
+
+            self._sim_thread = threading.Thread(target=self._wrapped_init_ue_sim, name="uebridge-init-ue")
+            self._sim_thread.start()
+            warmup = float(os.environ.get("OPENFLY_UE_WARMUP_SEC", "90"))
+            print(
+                f"Waiting {warmup}s for UE + UnrealCV to listen on port {self._ue_port}...",
+                flush=True,
+            )
+            time.sleep(warmup)
+
+        if self._sim_init_error is not None:
+            err = self._sim_init_error
+            raise RuntimeError(f"Старт CitySample в фоне упал: {err!r}") from err
+        if not self._attach_only and self.process is None:
+            raise RuntimeError(
+                "Процесс CitySample не создан (Popen не вызван). См. stderr Python и OPENFLY_UE_LOGFILE."
+            )
+
         self._connection_check()
 
-        self._camera_init()
+        post_retries = int(os.environ.get("OPENFLY_UE_POST_CONNECT_RETRIES", "2"))
+        for n in range(post_retries + 1):
+            try:
+                self._camera_init()
+                self._apply_ue_exposure_mitigation()
+                break
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as e:
+                last_pipe_err = e
+                print(
+                    f"UnrealCV: обрыв сокета при инициализации камеры/vrun ({type(e).__name__}: {e!r}), "
+                    f"переподключение {n + 1}/{post_retries}…",
+                    flush=True,
+                )
+                if n >= post_retries:
+                    raise RuntimeError(
+                        "UnrealCV разорвал соединение (Broken pipe / reset) на этапе _camera_init или vrun. "
+                        "Часто помогает OPENFLY_UE_SKIP_CAMERAS_SPAWN=1 (не вызывать vset /cameras/spawn в City Sample) "
+                        "или OPENFLY_UE_VRUN=off. См. лог CitySample."
+                    ) from e
+                self._reset_unrealcv_client()
+                time.sleep(3)
+                self._connection_check()
 
         # self._drone_init()  
         self.distance_to_goal = []
@@ -169,15 +260,25 @@ class UEBridge:
 
     def modify_port_in_ini(self, port, ue_env_name):
         ini_file = f"envs/ue/{ue_env_name}/City_UE52/Binaries/Linux/unrealcv.ini"
-        with open(ini_file, 'r') as file:
+        with open(ini_file, "r", encoding="utf-8", errors="replace") as file:
             lines = file.readlines()
 
-        with open(ini_file, 'w') as file:
+        with open(ini_file, "w", encoding="utf-8") as file:
             for line in lines:
-                if line.startswith("Port="):
+                s = line.strip()
+                if s.upper().startswith("PORT="):
                     file.write(f"Port={port}\n")
                 else:
                     file.write(line)
+            file.flush()
+            os.fsync(file.fileno())
+
+    def _wrapped_init_ue_sim(self) -> None:
+        try:
+            self._init_ue_sim()
+        except Exception as e:
+            self._sim_init_error = e
+            traceback.print_exc()
 
     def kill_failed_process(self):
         result = subprocess.run(['pgrep', '-n', 'CrashReport'], stdout=subprocess.PIPE)
@@ -185,33 +286,123 @@ class UEBridge:
         if len(cr_pid) > 0:
             subprocess.run(['kill', '-9', cr_pid])
 
-        result = subprocess.run(['pgrep', '-n', 'CitySample'], stdout=subprocess.PIPE)
-        cr_pid = result.stdout.decode().strip()
-        if len(cr_pid) > 0:
-            subprocess.run(['kill', '-9', cr_pid])
+        # Снимаем все CitySample (pgrep -n оставлял зомби на старом порту UnrealCV).
+        for _ in range(8):
+            result = subprocess.run(
+                ["pgrep", "-f", "City_UE52/Binaries/Linux/CitySample"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+            pids = [p for p in result.stdout.strip().split() if p.isdigit()]
+            if not pids:
+                break
+            for pid in pids:
+                subprocess.run(["kill", "-9", pid], stderr=subprocess.DEVNULL)
+            time.sleep(0.5)
 
     def _init_ue_sim(self):
         env_dir = "envs/ue/" + self.env_name
         if not os.path.exists(env_dir):
             raise ValueError(f"Specified directory {env_dir} does not exist")
 
-        command = ["bash", f"{env_dir}/CitySample.sh"]
+        env_dir_abs = os.path.abspath(env_dir)
+        sh_path = os.path.join(env_dir_abs, "CitySample.sh")
+        command = ["bash", sh_path]
+        extra_args = os.environ.get("OPENFLY_UE_BINARY_ARGS", "-log").strip()
+        if extra_args:
+            command.extend(shlex.split(extra_args))
+        print("CitySample cmd:", command, "cwd=", env_dir_abs, flush=True)
 
-        self.process = subprocess.Popen(command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        stdout, stderr = self.process.communicate()
-        # print("Command output:\n", stdout)
-        time.sleep(2)
+        # Long-running UE: avoid PIPE (deadlock). Optional log: OPENFLY_UE_LOGFILE=/tmp/ue.log
+        # Держим файловый объект на self — иначе после выхода из функции GC может закрыть FD родителя.
+        log_path = os.environ.get("OPENFLY_UE_LOGFILE", "").strip()
+        if log_path:
+            self._ue_log_fp = open(log_path, "ab", buffering=0)
+            out, err = self._ue_log_fp, self._ue_log_fp
+        else:
+            out, err = subprocess.DEVNULL, subprocess.DEVNULL
+        self.process = subprocess.Popen(
+            command,
+            cwd=env_dir_abs,
+            stdout=out,
+            stderr=err,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
 
     def __del__(self):
-        self._client.disconnect()
+        c = getattr(self, "_client", None)
+        if c is not None:
+            try:
+                c.disconnect()
+            except Exception:
+                pass
+
+    def _reset_unrealcv_client(self) -> None:
+        """После BrokenPipe клиент может оставить «живой» isconnected — сбрасываем перед reconnect."""
+        c = getattr(self, "_client", None)
+        if c is None:
+            return
+        try:
+            c.disconnect()
+        except Exception:
+            pass
+        self._client = None
 
     def _connection_check(self):
-        '''Check if connected'''
-        if self._client.connect():
-            print('UnrealCV connected successfully')
-        else:
-            print('UnrealCV is not connected')
-            exit()
+        """UnrealCV: каждая попытка с новым Client (устойчивее к «зависшему» сокету)."""
+        extra = float(os.environ.get("OPENFLY_UNREALCV_WAIT_EXTRA_SEC", "300"))
+        deadline = time.time() + extra
+        attempt = 0
+        while time.time() < deadline:
+            attempt += 1
+            proc = getattr(self, "process", None)
+            if proc is not None and proc.poll() is not None:
+                rc = proc.returncode
+                raise RuntimeError(
+                    f"CitySample завершился до готовности UnrealCV (exit code={rc}). "
+                    "См. OPENFLY_UE_LOGFILE, docker logs контейнера, на хосте dmesg при подозрении на OOM."
+                )
+            c_old = getattr(self, "_client", None)
+            if c_old is not None:
+                try:
+                    c_old.disconnect()
+                except Exception:
+                    pass
+            port_i = int(self._ue_port)
+            unix_path = f"/tmp/unrealcv_{port_i}.socket"
+            tcp_only = os.environ.get("OPENFLY_UNREALCV_TCP_ONLY", "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+            # UE 5.x UnrealCV часто поднимает UDS (см. лог «uds server socket created at: /tmp/unrealcv_<port>.socket»),
+            # тогда TCP на том же порту не отдаёт handshake «connected» — клиент бесконечно ждёт.
+            if (
+                not tcp_only
+                and sys.platform.startswith("linux")
+                and os.path.exists(unix_path)
+            ):
+                self._client = Client(unix_path, "unix")
+                if attempt == 1 or attempt % 10 == 0:
+                    print(f"UnrealCV: пробуем Unix socket {unix_path!r}", flush=True)
+            else:
+                self._client = Client((self._ue_ip, port_i))
+                if attempt == 1 or attempt % 10 == 0:
+                    print(f"UnrealCV: пробуем TCP {self._ue_ip!r}:{port_i}", flush=True)
+            if self._client.connect():
+                print("UnrealCV connected successfully", flush=True)
+                return
+            if attempt == 1 or attempt % 10 == 0:
+                print(
+                    f"UnrealCV not ready yet (attempt {attempt}), retrying for up to {extra:.0f}s...",
+                    flush=True,
+                )
+            time.sleep(5)
+        print("UnrealCV is not connected (timeout)", flush=True)
+        raise SystemExit(1)
 
     def set_camera_pose(self, x, y, z, pitch, yaw, roll):
         '''Set camera position'''
@@ -232,11 +423,48 @@ class UEBridge:
     def _camera_init(self):
         '''Camera initialization'''
         time.sleep(2)
-        self._client.request('vset /cameras/spawn')
-        self._client.request('vset /camera/1/size 1920 1080')
+        skip_spawn = os.environ.get("OPENFLY_UE_SKIP_CAMERAS_SPAWN", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+        if not skip_spawn:
+            self._client.request("vset /cameras/spawn")
+        else:
+            print("OPENFLY_UE_SKIP_CAMERAS_SPAWN=1 — пропуск vset /cameras/spawn", flush=True)
+        self._client.request("vset /camera/1/size 1920 1080")
         time.sleep(2)
-        self.set_camera_pose(150, 400, 15, 0, 0, 0)  # Initial position
+        x, y, z, pitch, yaw, roll = ue_camera_pose_from_env()
+        self.set_camera_pose(x, y, z, pitch, yaw, roll)
         time.sleep(2)
+
+    def _apply_ue_exposure_mitigation(self):
+        """Поджать пересвет (City Sample + UnrealCV / lit). Команды UE через vrun.
+
+        Отключить: OPENFLY_UE_VRUN=off
+        Свой список (через ';', без префикса vrun). В UE 5.2 City Sample r.BloomIntensity часто не распознаётся — см. capture_openfly_ue_frames.py.
+        """
+        flag = os.environ.get("OPENFLY_UE_VRUN", "").strip()
+        if flag.lower() in ("0", "off", "false", "no"):
+            return
+        if flag:
+            cmds = [c.strip() for c in flag.split(";") if c.strip()]
+        else:
+            # Согласовано с scripts/capture_openfly_ue_frames.py (без r.BloomIntensity в UE 5.2)
+            cmds = [
+                "r.DefaultFeature.AutoExposure.Bias -3.0",
+                "r.BloomQuality 2",
+                "r.DefaultFeature.AutoExposure 1",
+            ]
+        for cmd in cmds:
+            req = cmd if cmd.startswith("vrun ") else f"vrun {cmd}"
+            try:
+                self._client.request(req)
+                print("UE vrun:", req, flush=True)
+            except Exception as e:
+                print("UE vrun skipped:", req, repr(e), flush=True)
+        time.sleep(1.5)
 
     def get_camera_data(self, camera_type = 'lit'):
         valid_types = {'lit', 'object_mask', 'depth'}
@@ -444,7 +672,11 @@ def get_action(policy, processor, image_list, text, his, if_his=False, his_step=
             images.append(img)
         
     prompt = text
-    inputs = processor(prompt, images).to("cuda:0", dtype=torch.bfloat16)
+    inputs = processor(prompt, images).to("cuda:0")
+    # Нельзя .to(dtype=bfloat16) на весь BatchFeature — input_ids должны остаться long (иначе ломается causal mask в generate).
+    for _k, _v in list(inputs.items()):
+        if isinstance(_v, torch.Tensor) and _v.is_floating_point():
+            inputs[_k] = _v.to(dtype=torch.bfloat16)
     action = policy.predict_action(**inputs, unnorm_key="vlnv1", do_sample=False)
     print("raw action:", action)
     action = action.round().astype(int)
@@ -499,28 +731,53 @@ def getPoseAfterMakeAction(new_pose, action):
     return [x, y, z, yaw]
 
 def main():
-    eval_info = "configs/eval_test.json"
+    eval_info = os.environ.get("OPENFLY_EVAL_JSON", "configs/eval_test.json")
 
     f = open(eval_info, 'r')
     all_eval_info = json.loads(f.read())
     f.close()
     
-    # Load model
-    model_name_or_path="IPEC-COMMUNITY/openfly-agent-7b"
-    processor = AutoProcessor.from_pretrained(model_name_or_path)
-    policy = AutoModelForVision2Seq.from_pretrained(
-        model_name_or_path, 
-        attn_implementation="flash_attention_2",  # [Optional] Requires `flash_attn`
-        torch_dtype=torch.bfloat16, 
-        low_cpu_mem_usage=True, 
+    # Load model (local dir or HF id; OPENFLY_MODEL overrides default)
+    model_name_or_path = os.environ.get(
+        "OPENFLY_MODEL", "IPEC-COMMUNITY/openfly-agent-7b"
+    )
+    processor = AutoProcessor.from_pretrained(
+        model_name_or_path, trust_remote_code=True
+    )
+    load_kw = dict(
+        torch_dtype=torch.bfloat16,
+        low_cpu_mem_usage=True,
         trust_remote_code=True,
-    ).to("cuda:0")
+    )
+    attn_impl = os.environ.get(
+        "OPENFLY_ATTN_IMPLEMENTATION", "flash_attention_2"
+    )
+    try:
+        policy = AutoModelForVision2Seq.from_pretrained(
+            model_name_or_path,
+            attn_implementation=attn_impl,
+            **load_kw,
+        ).to("cuda:0")
+    except Exception as e:
+        print(
+            "Model load failed with attn_implementation=",
+            attn_impl,
+            "(",
+            repr(e),
+            "); retrying eager",
+            flush=True,
+        )
+        policy = AutoModelForVision2Seq.from_pretrained(
+            model_name_or_path,
+            attn_implementation="eager",
+            **load_kw,
+        ).to("cuda:0")
 
     # Test metrics
     acc = 0
     stop = 0
     data_num = 0
-    MAX_STEP = 100
+    MAX_STEP = int(os.environ.get("OPENFLY_MAX_STEPS", "100"))
 
     # Group by environment type
     env_groups = {}
@@ -560,6 +817,35 @@ def main():
             new_pose = [start_postion[0], start_postion[1], start_postion[2], start_yaw]
             end_position = pos_list[-1]
             print(f"Sample {idx}: {start_postion} -> {end_position}, initial heading: {start_yaw}")
+
+            save_frames = os.environ.get("OPENFLY_SAVE_ACTION_FRAMES", "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+            )
+            rollout_base = os.environ.get("OPENFLY_ROLLOUT_BASE", "").strip()
+            if save_frames and rollout_base:
+                slug = item["image_path"].replace("/", "__")
+                frame_dir = os.path.join(rollout_base, f"{idx:02d}_{slug}")
+                os.makedirs(frame_dir, exist_ok=True)
+                with open(os.path.join(frame_dir, "instruction.txt"), "w", encoding="utf-8") as tf:
+                    tf.write(text)
+                with open(os.path.join(frame_dir, "episode.json"), "w", encoding="utf-8") as jf:
+                    json.dump(
+                        {
+                            "image_path": item.get("image_path"),
+                            "start_xyz": list(start_postion),
+                            "start_yaw_rad": float(start_yaw),
+                            "goal_xyz": list(end_position),
+                        },
+                        jf,
+                        indent=2,
+                    )
+            else:
+                frame_dir = (
+                    os.environ.get("OPENFLY_ACTION_FRAMES_DIR", "test/action_frames").strip()
+                    or "test/action_frames"
+                )
             
             stop_error = 1
             image_error = False
@@ -585,6 +871,10 @@ def main():
                 try:
                     raw_image = env_bridge.get_camera_data()
                     cv2.imwrite("test/cur_img.jpg", raw_image)
+                    if save_frames:
+                        fd = frame_dir
+                        os.makedirs(fd, exist_ok=True)
+                        cv2.imwrite(os.path.join(fd, f"step_{step:04d}.png"), raw_image)
                     image = raw_image
                     
                     image_list.append(image)
@@ -629,6 +919,34 @@ def main():
             if flag_osr == 0:
                 env_bridge.osr.append(0)
             env_bridge.print_info()
+
+            if save_frames and rollout_base and os.path.isdir(frame_dir):
+                fps = float(os.environ.get("OPENFLY_ROLLOUT_FPS", "4"))
+                mp4_path = os.path.join(frame_dir, "rollout.mp4")
+                pat = os.path.join(frame_dir, "step_*.png")
+
+                if glob.glob(pat):
+                    cmd = [
+                        "ffmpeg",
+                        "-y",
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-framerate",
+                        str(fps),
+                        "-i",
+                        os.path.join(frame_dir, "step_%04d.png"),
+                        "-c:v",
+                        "libx264",
+                        "-pix_fmt",
+                        "yuv420p",
+                        mp4_path,
+                    ]
+                    r = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                    if r.returncode == 0:
+                        print(f"Wrote rollout video: {os.path.abspath(mp4_path)}", flush=True)
+                    else:
+                        print("ffmpeg failed:", r.stderr[:500], flush=True)
 
             if image_error:
                 continue
