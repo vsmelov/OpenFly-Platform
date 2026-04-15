@@ -869,6 +869,9 @@ def getPoseAfterMakeAction(new_pose, action):
     elif action == 9:
         x += step_size * math.cos(yaw) *3
         y += step_size * math.sin(yaw) *3
+    elif action == 10:
+        # make_photo (OpenFly UE dashboard / OpenAI policy): capture only — pose unchanged.
+        pass
 
     yaw = (yaw + math.pi) % (2 * math.pi) - math.pi
 
