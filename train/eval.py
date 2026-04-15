@@ -18,6 +18,7 @@ from PIL import Image
 from transformers import AutoConfig, AutoImageProcessor, AutoModelForVision2Seq, AutoProcessor
 import glob
 import os, json, sys
+import shutil
 from extern.hf.configuration_prismatic import OpenFlyConfig
 from extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
@@ -44,6 +45,21 @@ def ue_camera_pose_from_env():
         _f("OPENFLY_UE_CAMERA_YAW", 0),
         _f("OPENFLY_UE_CAMERA_ROLL", 0),
     )
+
+
+def _ensure_game_user_settings_best(ue_env_name: str) -> None:
+    """Как scripts/capture_openfly_ue_frames.ensure_best_profile — README / OPENFLY.md."""
+    raw = os.environ.get("OPENFLY_UE_ENSURE_BEST", "1").strip().lower()
+    if raw in ("0", "off", "false", "no"):
+        return
+    base = os.path.abspath(os.path.join("envs", "ue", ue_env_name, "City_UE52", "Saved", "Config", "Linux"))
+    best = os.path.join(base, "GameUserSettings_best.ini")
+    game = os.path.join(base, "GameUserSettings.ini")
+    if not os.path.isfile(best):
+        print(f"UEBridge: OPENFLY_UE_ENSURE_BEST: нет файла {best}, пропуск", flush=True)
+        return
+    shutil.copy2(best, game)
+    print(f"UEBridge: {best} -> {game} (OPENFLY_UE_ENSURE_BEST)", flush=True)
 
 
 def kill_env_process(keyword):
@@ -307,6 +323,7 @@ class UEBridge:
             raise ValueError(f"Specified directory {env_dir} does not exist")
 
         env_dir_abs = os.path.abspath(env_dir)
+        _ensure_game_user_settings_best(self.env_name)
         sh_path = os.path.join(env_dir_abs, "CitySample.sh")
         command = ["bash", sh_path]
         extra_args = os.environ.get("OPENFLY_UE_BINARY_ARGS", "-log").strip()
