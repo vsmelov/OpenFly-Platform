@@ -768,19 +768,24 @@ def format_vla_instruction_for_model(instruction: str) -> str:
 
     Сырой промпт без обёртки даёт другие токены, чем при обучении — модель часто «ломается»
     в однообразное движение (например только вперёд). Обход: OPENFLY_VLA_RAW_PROMPT=1.
+
+    Не импортируем ``model.prompt_llama2``: ``import model`` тянет ``model/__init__.py`` → overwatch →
+    ``logging.config.dictConfig`` с RichHandler; из ``asyncio.to_thread`` (дашборд) это даёт
+    ``ValueError: Unable to configure handler 'console'``.
     """
     ins = instruction.strip()
     raw = os.environ.get("OPENFLY_VLA_RAW_PROMPT", "").strip().lower() in ("1", "true", "yes", "on")
     if raw:
         return ins
-    from model.prompt_llama2 import LLaMa2ChatPromptBuilder
-
-    pb = LLaMa2ChatPromptBuilder("openvla")
-    pb.add_turn(
-        role="human",
-        message=f"What action should the robot take to {ins.lower()}?",
+    # Должно совпадать с LLaMa2ChatPromptBuilder("openvla").add_turn(human, ...) при turn_count==0.
+    sys_inner = (
+        "You are a helpful language and vision assistant. "
+        "You are able to understand the visual content that the user provides, "
+        "and assist the user with a variety of tasks using natural language."
     )
-    return pb.get_prompt()
+    sys_block = f"<<SYS>\n{sys_inner.strip()}\n<</SYS>>\n\n"
+    task = f"What action should the robot take to {ins.lower()}?"
+    return f"[INST] {sys_block}{task} [/INST] "
 
 
 def get_action(policy, processor, image_list, text, his, if_his=False, his_step=0):
