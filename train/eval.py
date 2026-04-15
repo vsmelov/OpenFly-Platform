@@ -755,6 +755,34 @@ def convert_to_action_id(action):
         result = 0
     return result
 
+
+def _numpy_bgr_to_pil_rgb(arr: np.ndarray) -> Image.Image:
+    """UnrealCV / cv2 отдают BGR; Prismatic/CLIP ждут RGB (как в обучении)."""
+    if arr.ndim == 3 and arr.shape[2] == 3:
+        return Image.fromarray(cv2.cvtColor(arr, cv2.COLOR_BGR2RGB))
+    return Image.fromarray(arr)
+
+
+def format_vla_instruction_for_model(instruction: str) -> str:
+    """Тот же текст, что в train/model/load_model.py OpenFly.predict_action (LLaMA2 chat + вопрос).
+
+    Сырой промпт без обёртки даёт другие токены, чем при обучении — модель часто «ломается»
+    в однообразное движение (например только вперёд). Обход: OPENFLY_VLA_RAW_PROMPT=1.
+    """
+    ins = instruction.strip()
+    raw = os.environ.get("OPENFLY_VLA_RAW_PROMPT", "").strip().lower() in ("1", "true", "yes", "on")
+    if raw:
+        return ins
+    from model.prompt_llama2 import LLaMa2ChatPromptBuilder
+
+    pb = LLaMa2ChatPromptBuilder("openvla")
+    pb.add_turn(
+        role="human",
+        message=f"What action should the robot take to {ins.lower()}?",
+    )
+    return pb.get_prompt()
+
+
 def get_action(policy, processor, image_list, text, his, if_his=False, his_step=0):
 
     # Otherwise, generate new actions using the policy
@@ -764,16 +792,14 @@ def get_action(policy, processor, image_list, text, his, if_his=False, his_step=
         image_list = align_numpy_frames_for_vlm(image_list)
 
     if isinstance(image_list, np.ndarray):
-        img = image_list
-        img = Image.fromarray(img)
+        img = _numpy_bgr_to_pil_rgb(image_list)
         images = [img, img, img]
     else:
         images = []
         for img in image_list:
-            img = Image.fromarray(img)
-            images.append(img)
-        
-    prompt = text
+            images.append(_numpy_bgr_to_pil_rgb(img))
+
+    prompt = format_vla_instruction_for_model(text)
     inputs = processor(prompt, images).to("cuda:0")
     # Нельзя .to(dtype=bfloat16) на весь BatchFeature — input_ids должны остаться long (иначе ломается causal mask в generate).
     for _k, _v in list(inputs.items()):
