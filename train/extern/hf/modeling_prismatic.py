@@ -124,7 +124,11 @@ class PrismaticVisionBackbone(nn.Module):
         patches4, patches_fused4 = self.featurizer(img4)[1][:, :1, :], self.post_process(self.fused_featurizer(img_fused4)[0], grid_size)
 
         img5, img_fused5 = torch.split(pixel_values[2:3], [3, 3], dim=1)
-        patches5, patches_fused5 = self.featurizer(img5)[0], self.fused_featurizer(img_fused5)[0]
+        # Кадры 0–1: prefix [1][:, :1, :] + post_process(fused[0]). Раньше кадр 2 брал [0] и fused без post_process —
+        # при чуть разных входах ViT давал расхождение на 1 по spatial (282 vs 281) на torch.cat(..., dim=2).
+        patches5, patches_fused5 = self.featurizer(img5)[1][:, :1, :], self.post_process(
+            self.fused_featurizer(img_fused5)[0], grid_size
+        )
 
         return [torch.cat([patches3, patches_fused3], dim=2), torch.cat([patches4, patches_fused4], dim=2), torch.cat([patches5, patches_fused5], dim=2)]
       
