@@ -664,6 +664,25 @@ def get_images(lst,if_his,step):
             elif len(lst) == 1:
                 return [lst[0],lst[0], lst[0]]
 
+
+def align_numpy_frames_for_vlm(frames: list) -> list:
+    """Одинаковый (H, W) для списка BGR-кадров перед PIL/processor.
+
+    UnrealCV иногда даёт соседние кадры с разницей в 1 px; дальше torch.stack в VLM падает
+    (например 282 vs 281 по ширине). Всегда ресайзим каждый кадр к общим min(H), min(W) (чётные).
+    """
+    if not frames:
+        return frames
+    h = min(int(f.shape[0]) for f in frames)
+    w = min(int(f.shape[1]) for f in frames)
+    h = max(2, h - (h % 2))
+    w = max(2, w - (w % 2))
+    return [
+        np.ascontiguousarray(cv2.resize(f, (w, h), interpolation=cv2.INTER_LINEAR))
+        for f in frames
+    ]
+
+
 def convert_to_action_id(action):
     action_dict = {
         "0": np.array([1, 0, 0, 0, 0, 0, 0, 0]).astype(np.float32),  # stop
@@ -695,6 +714,9 @@ def get_action(policy, processor, image_list, text, his, if_his=False, his_step=
 
     # Otherwise, generate new actions using the policy
     image_list = get_images(image_list, if_his, his_step)
+
+    if isinstance(image_list, list):
+        image_list = align_numpy_frames_for_vlm(image_list)
 
     if isinstance(image_list, np.ndarray):
         img = image_list
