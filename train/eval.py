@@ -872,6 +872,9 @@ def getPoseAfterMakeAction(new_pose, action):
     elif action == 10:
         # make_photo (OpenFly UE dashboard / OpenAI policy): capture only — pose unchanged.
         pass
+    elif action == 12:
+        # send_to_user (OpenFly UE dashboard / OpenAI policy): message to pilot only — pose unchanged.
+        pass
 
     yaw = (yaw + math.pi) % (2 * math.pi) - math.pi
 
