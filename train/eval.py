@@ -47,6 +47,46 @@ def ue_camera_pose_from_env():
     )
 
 
+def openfly_ue_streaming_cap_vrun_commands() -> list[str]:
+    """Console commands (without ``vrun `` prefix) to cap texture streaming memory — best-effort, not an OS VRAM cap.
+
+    ``OPENFLY_UE_STREAMING_CAP=off`` — skip entirely (default when unset and no pool/budget set from caller).
+
+    ``OPENFLY_UE_TEXTURE_POOL_MB`` — set ``r.Streaming.PoolSize`` to this many MiB (direct override).
+
+    ``OPENFLY_UE_VRAM_BUDGET_MB`` — heuristic target for **total** GPU use: streaming pool ≈ 62% of budget
+    (reserve for meshes, render targets, driver slack). Clamped so pool ≤ budget − 512 MiB, pool ≥ 256 MiB.
+
+    If both ``OPENFLY_UE_TEXTURE_POOL_MB`` and ``OPENFLY_UE_VRAM_BUDGET_MB`` are set, **texture pool wins**.
+
+    Always adds ``r.Streaming.LimitPoolSizeToVRAM 1`` when a pool size is applied.
+    """
+    cap_off = os.environ.get("OPENFLY_UE_STREAMING_CAP", "").strip().lower() in ("0", "off", "false", "no")
+    if cap_off:
+        return []
+    pool_raw = os.environ.get("OPENFLY_UE_TEXTURE_POOL_MB", "").strip()
+    budget_raw = os.environ.get("OPENFLY_UE_VRAM_BUDGET_MB", "").strip()
+    pool_mb: int | None = None
+    if pool_raw:
+        try:
+            pool_mb = max(64, int(pool_raw))
+        except ValueError:
+            pool_mb = None
+    elif budget_raw:
+        try:
+            budget = max(512, int(budget_raw))
+            heur = int(budget * 0.62)
+            pool_mb = max(256, min(heur, budget - 512))
+        except ValueError:
+            pool_mb = None
+    if pool_mb is None:
+        return []
+    return [
+        f"r.Streaming.PoolSize {pool_mb}",
+        "r.Streaming.LimitPoolSizeToVRAM 1",
+    ]
+
+
 def _ensure_game_user_settings_best(ue_env_name: str) -> None:
     """Как scripts/capture_openfly_ue_frames.ensure_best_profile — README / OPENFLY.md."""
     raw = os.environ.get("OPENFLY_UE_ENSURE_BEST", "1").strip().lower()
@@ -245,17 +285,18 @@ class UEBridge:
             try:
                 self._camera_init()
                 self._apply_ue_exposure_mitigation()
+                self._apply_ue_texture_streaming_cap()
                 break
             except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError) as e:
                 last_pipe_err = e
                 print(
-                    f"UnrealCV: обрыв сокета при инициализации камеры/vrun ({type(e).__name__}: {e!r}), "
+                    f"UnrealCV: обрыв сокета при инициализации камеры/vrun/streaming-cap ({type(e).__name__}: {e!r}), "
                     f"переподключение {n + 1}/{post_retries}…",
                     flush=True,
                 )
                 if n >= post_retries:
                     raise RuntimeError(
-                        "UnrealCV разорвал соединение (Broken pipe / reset) на этапе _camera_init или vrun. "
+                        "UnrealCV разорвал соединение (Broken pipe / reset) на этапе _camera_init, vrun или streaming-cap. "
                         "Часто помогает OPENFLY_UE_SKIP_CAMERAS_SPAWN=1 (не вызывать vset /cameras/spawn в City Sample) "
                         "или OPENFLY_UE_VRUN=off. См. лог CitySample."
                     ) from e
@@ -556,6 +597,20 @@ class UEBridge:
             except Exception as e:
                 print("UE vrun skipped:", req, repr(e), flush=True)
         time.sleep(1.5)
+
+    def _apply_ue_texture_streaming_cap(self):
+        """Cap streaming texture pool via ``vrun`` (``OPENFLY_UE_VRAM_BUDGET_MB`` / ``OPENFLY_UE_TEXTURE_POOL_MB``)."""
+        cmds = openfly_ue_streaming_cap_vrun_commands()
+        if not cmds:
+            return
+        for cmd in cmds:
+            req = cmd if cmd.startswith("vrun ") else f"vrun {cmd}"
+            try:
+                self._client.request(req)
+                print("UE streaming cap:", req, flush=True)
+            except Exception as e:
+                print("UE streaming cap skipped:", req, repr(e), flush=True)
+        time.sleep(0.5)
 
     def get_camera_data(self, camera_type = 'lit'):
         valid_types = {'lit', 'object_mask', 'depth'}
@@ -874,6 +929,9 @@ def getPoseAfterMakeAction(new_pose, action):
         pass
     elif action == 12:
         # send_to_user (OpenFly UE dashboard / OpenAI policy): message to pilot only — pose unchanged.
+        pass
+    elif action == 13:
+        # exit (OpenFly UE dashboard / OpenAI policy): mission/instruction done — pose unchanged.
         pass
 
     yaw = (yaw + math.pi) % (2 * math.pi) - math.pi
