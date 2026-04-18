@@ -6,6 +6,8 @@ log/
 **.pcd
 uav_vln_data/
 env_seg_info/
+# Local drop dir (e.g. zips) — do not track
+envs/ue/ue/
 
 image/
 test/
