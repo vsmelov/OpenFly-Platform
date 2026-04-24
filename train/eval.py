@@ -489,6 +489,11 @@ class UEBridge:
                 "yes",
                 "on",
             )
+            attach_wants_uds = (
+                _openfly_ue_attach_only()
+                and os.environ.get("OPENFLY_UNREALCV_UDS_ON_ATTACH", "").strip().lower()
+                in ("1", "true", "yes", "on")
+            )
             # UE 5.x UnrealCV часто поднимает UDS; для встроенного старта UE без attach TCP иногда «молчит».
             # В OPENFLY_UE_ATTACH_ONLY файл сокета может остаться от старого процесса — unrealcv Client(..., 'unix')
             # .connect() тогда долго висит, хотя TCP на порту жив. По умолчанию attach → TCP; UDS явно:
@@ -498,14 +503,17 @@ class UEBridge:
                 and sys.platform.startswith("linux")
                 and os.path.exists(unix_path)
             )
+            if attach_wants_uds and not tcp_only and sys.platform.startswith("linux") and not os.path.exists(unix_path):
+                if attempt == 1 or attempt % 10 == 0:
+                    print(
+                        f"UnrealCV: ждём Unix socket {unix_path!r} "
+                        "(OPENFLY_UNREALCV_UDS_ON_ATTACH=1); TCP fallback disabled for attach.",
+                        flush=True,
+                    )
+                time.sleep(2)
+                continue
             if use_uds and _openfly_ue_attach_only():
-                uds_on = os.environ.get("OPENFLY_UNREALCV_UDS_ON_ATTACH", "").strip().lower() in (
-                    "1",
-                    "true",
-                    "yes",
-                    "on",
-                )
-                if not uds_on:
+                if not attach_wants_uds:
                     if attempt == 1:
                         print(
                             "UnrealCV: OPENFLY_UE_ATTACH_ONLY — подключение по TCP (не UDS), чтобы не "
